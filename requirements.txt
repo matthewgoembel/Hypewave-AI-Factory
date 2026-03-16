@@ -1,0 +1,31 @@
+# API / HTTP
+requests==2.31.0
+aiohttp==3.9.3
+websocket-client==1.7.0
+python-dotenv==1.0.0
+
+# Database — MongoDB
+pymongo==4.6.2
+motor==3.3.2          # async MongoDB driver
+
+# Data
+pandas==2.2.0
+numpy==1.26.4
+
+# Dashboard
+streamlit==1.31.1
+plotly==5.18.0
+
+# Scheduling
+apscheduler==3.10.4
+
+# Polymarket CLOB
+py-clob-client==0.16.0
+
+# Kalshi auth (RSA signing)
+cryptography==42.0.4
+PyJWT==2.8.0
+
+# Utilities
+python-dateutil==2.8.2
+pytz==2024.1

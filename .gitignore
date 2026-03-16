@@ -1,5 +1,7 @@
 # Secrets - NEVER commit these
 .env
+trading_wallets.txt
+wallets.txt
 *.env
 .env.*
 readMe/.env
