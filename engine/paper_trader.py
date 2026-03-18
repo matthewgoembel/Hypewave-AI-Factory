@@ -1,67 +1,73 @@
 """
-Paper trading engine.
-Simulates trades when signals fire, tracks per-whale PnL against a $500 budget.
-Fetches current market prices to calculate unrealized PnL.
-When a market resolves (price → 1.0 or 0.0), closes the position and books realized PnL.
+Paper trading engine — single wallet, simulates live account behaviour.
+Winning positions sit as "pending_claim" for 60s before cash returns,
+matching the real-world delay of claiming resolved positions.
 """
 
-import sys, os, logging
+import sys, os, logging, requests
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from database.db import Database
 from connectors.polymarket import PolymarketConnector
 
 log = logging.getLogger("paper_trader")
 
-# $500 per whale, $2500 total
-BUDGET_PER_WHALE = 100.0
-WALLETS = [
-    "0xd0d6053c3c37e727402d84c14069780d360993aa",  # whale1
-]
-TOTAL_BUDGET = BUDGET_PER_WHALE * len(WALLETS)   # $100 total
-
-# Cap individual trade size so one bad bet doesn't wipe the whale's budget
-MAX_TRADE_PCT    = 0.10   # max 10% of whale's budget per trade ($10)
-MIN_TRADE_USD    = 0.50   # ignore signals under $0.50 (noise)
-RESOLVED_THRESH  = 0.97   # price ≥ 0.97 or ≤ 0.03 = treat as resolved
+# ── Config — change WALLET to test a different whale ──────────────────────────
+WALLET          = "0xd0d6053c3c37e727402d84c14069780d360993aa"  # whale1
+BUDGET          = 100.0   # starting paper balance
+MIN_TRADE_USD   = 0.50
+CLOB_FEE        = 0.005   # 0.5% per trade
+RESOLVED_THRESH = 0.97
+CLAIM_DELAY_S   = 60      # seconds before a won position returns cash
 
 
 class PaperTrader:
     def __init__(self):
         self.db = Database()
         self.pm = PolymarketConnector()
-        self._ensure_whale_accounts()
+        self._whale_portfolio = self._fetch_whale_portfolio()
+        self._ensure_account()
 
-    # ------------------------------------------------------------------
-    # Account setup
-    # ------------------------------------------------------------------
+    # ── Whale portfolio for proportional scaling ──────────────────────────────
 
-    def _ensure_whale_accounts(self):
-        """Create a paper account for each whale if it doesn't exist."""
-        for addr in WALLETS:
-            existing = self.db.db["paper_accounts"].find_one({"address": addr})
-            if not existing:
-                self.db.db["paper_accounts"].insert_one({
-                    "address":      addr,
-                    "budget":       BUDGET_PER_WHALE,
-                    "balance":      BUDGET_PER_WHALE,   # available cash
-                    "realized_pnl": 0.0,
-                    "total_wagered": 0.0,
-                    "wins":         0,
-                    "losses":       0,
-                    "created_at":   datetime.now(timezone.utc),
-                    "updated_at":   datetime.now(timezone.utc),
-                })
-                log.info(f"Created paper account for {addr[:10]}... — ${BUDGET_PER_WHALE}")
+    def _fetch_whale_portfolio(self) -> float:
+        try:
+            r = requests.get(
+                f"https://data-api.polymarket.com/value?user={WALLET}",
+                timeout=5
+            )
+            data = r.json()
+            if isinstance(data, list) and data:
+                val = float(data[0].get("value", 0))
+                if val > 0:
+                    return val
+        except Exception:
+            pass
+        return 35895.0  # fallback
 
-    def get_account(self, address: str) -> dict:
-        return self.db.db["paper_accounts"].find_one({"address": address})
+    # ── Account setup ─────────────────────────────────────────────────────────
 
-    def get_all_accounts(self) -> list:
-        return list(self.db.db["paper_accounts"].find())
+    def _ensure_account(self):
+        existing = self.db.db["paper_accounts"].find_one({"address": WALLET})
+        if not existing:
+            self.db.db["paper_accounts"].insert_one({
+                "address":       WALLET,
+                "budget":        BUDGET,
+                "balance":       BUDGET,
+                "realized_pnl":  0.0,
+                "total_wagered": 0.0,
+                "wins":          0,
+                "losses":        0,
+                "created_at":    datetime.now(timezone.utc),
+                "updated_at":    datetime.now(timezone.utc),
+            })
+            log.info(f"Created paper account for {WALLET[:10]} — ${BUDGET}")
 
-    def _update_account(self, address: str, delta_balance: float, delta_pnl: float,
+    def get_account(self) -> dict:
+        return self.db.db["paper_accounts"].find_one({"address": WALLET})
+
+    def _update_account(self, delta_balance: float, delta_pnl: float,
                         delta_wagered: float = 0, win: bool = None):
         update = {
             "$inc": {
@@ -71,23 +77,18 @@ class PaperTrader:
             },
             "$set": {"updated_at": datetime.now(timezone.utc)}
         }
-        if win is True:
-            update["$inc"]["wins"] = 1
-        elif win is False:
-            update["$inc"]["losses"] = 1
-        self.db.db["paper_accounts"].update_one({"address": address}, update)
+        if win is True:  update["$inc"]["wins"]   = 1
+        if win is False: update["$inc"]["losses"] = 1
+        self.db.db["paper_accounts"].update_one({"address": WALLET}, update)
 
-    # ------------------------------------------------------------------
-    # Execute a paper trade from a signal
-    # ------------------------------------------------------------------
+    # ── Execute a signal ──────────────────────────────────────────────────────
 
     def execute_signal(self, signal: dict) -> bool:
-        """
-        Simulate placing a trade based on a copy signal.
-        Returns True if trade was placed, False if skipped.
-        """
-        source   = signal.get("source", "")
-        account  = self.get_account(source)
+        source = signal.get("source", "")
+        if source != WALLET:
+            return False
+
+        account = self.get_account()
         if not account:
             return False
 
@@ -100,9 +101,26 @@ class PaperTrader:
         title       = signal.get("title", "")
 
         if price <= 0 or price >= 1:
-            return False   # skip degenerate prices
+            return False
 
-        # Scale whale's USD size proportionally to our budget
+        # SELL — close open position
+        if side == "SELL":
+            open_pos = self.db.db["paper_trades"].find_one({
+                "asset":  asset,
+                "status": "open",
+            })
+            if not open_pos:
+                self.db.signals.update_one(
+                    {"_id": signal["_id"]},
+                    {"$set": {"status": "skipped", "skip_reason": "no open position"}}
+                )
+                return False
+            won = price > open_pos["entry_price"]
+            self._close_trade(open_pos, price, won=won)
+            self.db.signals.update_one({"_id": signal["_id"]}, {"$set": {"status": "executed"}})
+            return True
+
+        # BUY
         whale_usdc = signal.get("usdc_size", 0)
         if whale_usdc < MIN_TRADE_USD:
             self.db.signals.update_one(
@@ -111,84 +129,81 @@ class PaperTrader:
             )
             return False
 
-        # Our trade = whale_usdc scaled to our budget ratio, capped at 10%
-        max_trade    = account["balance"] * MAX_TRADE_PCT
-        our_usdc     = min(whale_usdc, max_trade)
-        our_usdc     = max(our_usdc, MIN_TRADE_USD)
+        balance = account["balance"]
 
-        if our_usdc > account["balance"]:
+        if balance <= 0:
+            print(f"[Paper] Balance too low: ${balance:.2f}")
+            self.db.signals.update_one(
+                {"_id": signal["_id"]},
+                {"$set": {"status": "skipped", "skip_reason": "balance too low"}}
+            )
+            return False
+
+        scale    = balance / self._whale_portfolio
+        our_usdc = max(whale_usdc * scale, MIN_TRADE_USD)
+
+        if our_usdc > balance:
+            print(f"[Paper] Balance too low: ${balance:.2f}")
             self.db.signals.update_one(
                 {"_id": signal["_id"]},
                 {"$set": {"status": "skipped", "skip_reason": "insufficient balance"}}
             )
             return False
 
+        # Deduct fee
+        our_usdc   = our_usdc * (1 - CLOB_FEE)
         our_shares = our_usdc / price
 
-        # Record the paper trade
-        paper_trade = {
-            "source":       source,
-            "signal_id":    signal["_id"],
-            "market_id":    market_id,
-            "asset":        asset,
-            "side":         side,
-            "outcome":      outcome,
-            "outcome_idx":  outcome_idx,
-            "entry_price":  price,
-            "shares":       our_shares,
-            "cost_usdc":    our_usdc,
-            "title":        title,
-            "status":       "open",
+        trade = {
+            "source":        WALLET,
+            "signal_id":     signal["_id"],
+            "market_id":     market_id,
+            "asset":         asset,
+            "side":          side,
+            "outcome":       outcome,
+            "outcome_idx":   outcome_idx,
+            "entry_price":   price,
+            "shares":        our_shares,
+            "cost_usdc":     our_usdc,
+            "title":         title,
+            "status":        "open",
             "current_price": price,
             "unrealized_pnl": 0.0,
-            "realized_pnl":   None,
-            "opened_at":    datetime.now(timezone.utc),
-            "closed_at":    None,
+            "realized_pnl":  None,
+            "opened_at":     datetime.now(timezone.utc),
+            "resolved_at":   None,
+            "closed_at":     None,
         }
-        self.db.db["paper_trades"].insert_one(paper_trade)
-
-        # Deduct from balance
-        self._update_account(source, delta_balance=-our_usdc, delta_pnl=0, delta_wagered=our_usdc)
-
-        # Mark signal as executed
+        self.db.db["paper_trades"].insert_one(trade)
+        self._update_account(delta_balance=-our_usdc, delta_pnl=0, delta_wagered=our_usdc)
         self.db.signals.update_one(
             {"_id": signal["_id"]},
             {"$set": {"status": "executed", "paper_trade_usdc": our_usdc}}
         )
-
-        log.info(f"[Paper] {source[:10]} {side} {outcome} {title[:40]} — ${our_usdc:.2f} @ {price:.3f}")
+        print(f"[Paper] BUY {outcome} | {title[:50]} | ${our_usdc:.2f} @ {price:.3f}")
         return True
 
-    # ------------------------------------------------------------------
-    # Process pending signals
-    # ------------------------------------------------------------------
+    # ── Process pending signals ───────────────────────────────────────────────
 
     def process_pending_signals(self):
-        """Pick up any unexecuted signals and paper-trade them."""
         pending = list(self.db.signals.find({"status": "pending"}).sort("fired_at", 1).limit(100))
         placed = 0
         for sig in pending:
             if self.execute_signal(sig):
                 placed += 1
-        if placed:
-            log.info(f"[Paper] Placed {placed} paper trades from pending signals.")
         return placed
 
-    # ------------------------------------------------------------------
-    # Mark-to-market: update unrealized PnL on open positions
-    # ------------------------------------------------------------------
+    # ── Mark-to-market ────────────────────────────────────────────────────────
 
     def update_open_positions(self):
-        """
-        Fetch current prices for all open paper trades and update unrealized PnL.
-        Closes positions where the market has resolved.
-        """
+        # Auto-claim won positions after CLAIM_DELAY_S
+        self._process_pending_claims()
+
         open_trades = list(self.db.db["paper_trades"].find({"status": "open"}))
         if not open_trades:
             return
 
-        # Group by asset token to minimize API calls
-        asset_map: dict[str, list] = {}
+        asset_map: dict = {}
         for t in open_trades:
             a = t.get("asset", "")
             if a:
@@ -209,26 +224,32 @@ class PaperTrader:
                     continue
                 for trade in trades:
                     self._update_trade_price(trade, mid)
-
             except Exception as e:
                 status_code = getattr(getattr(e, "response", None), "status_code", None)
                 if status_code == 404:
-                    # Market expired — resolve using the gamma API final price
                     self._resolve_expired_trades(trades)
                 else:
-                    log.warning(f"[Paper] Price update failed for asset {asset[:12]}: {e}")
+                    log.warning(f"Price update failed for {asset[:12]}: {e}")
 
     def _update_trade_price(self, trade: dict, current_price: float):
-        entry  = trade["entry_price"]
         shares = trade["shares"]
         cost   = trade["cost_usdc"]
+        unrealized = (current_price - trade["entry_price"]) * shares
 
-        unrealized = (current_price - entry) * shares
-
-        # Check if market resolved
-        if current_price >= RESOLVED_THRESH:       # outcome won
-            self._close_trade(trade, current_price, won=True)
-        elif current_price <= (1 - RESOLVED_THRESH):  # outcome lost
+        if current_price >= RESOLVED_THRESH:
+            # Won — mark pending_claim, cash returns after delay
+            self.db.db["paper_trades"].update_one(
+                {"_id": trade["_id"]},
+                {"$set": {
+                    "status":        "pending_claim",
+                    "current_price": current_price,
+                    "resolved_at":   datetime.now(timezone.utc),
+                    "unrealized_pnl": round(unrealized, 4),
+                }}
+            )
+            print(f"[Paper] WON (pending claim) | {trade['title'][:50]}")
+        elif current_price <= (1 - RESOLVED_THRESH):
+            # Lost — close immediately
             self._close_trade(trade, current_price, won=False)
         else:
             self.db.db["paper_trades"].update_one(
@@ -240,13 +261,18 @@ class PaperTrader:
                 }}
             )
 
+    def _process_pending_claims(self):
+        """Close won positions that have waited CLAIM_DELAY_S seconds."""
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=CLAIM_DELAY_S)
+        claimable = list(self.db.db["paper_trades"].find({
+            "status":      "pending_claim",
+            "resolved_at": {"$lte": cutoff},
+        }))
+        for trade in claimable:
+            self._close_trade(trade, trade["current_price"], won=True)
+            print(f"[Paper] CLAIMED | {trade['title'][:50]} | PnL: ${trade['shares'] * trade['current_price'] - trade['cost_usdc']:+.2f}")
+
     def _resolve_expired_trades(self, trades: list):
-        """
-        Market orderbook is gone (404) — fetch final resolution from gamma API.
-        Only close a trade if we get a definitive resolved price (0.0 or 1.0).
-        If we can't confirm the outcome, leave it open — never guess.
-        """
-        import requests
         for trade in trades:
             condition_id = trade.get("market_id", "")
             outcome_idx  = trade.get("outcome_idx", -1)
@@ -256,72 +282,68 @@ class PaperTrader:
                     timeout=5
                 )
                 if r.status_code == 200:
-                    data = r.json()
+                    data   = r.json()
                     tokens = data.get("tokens") or []
-                    if tokens and isinstance(tokens, list) and outcome_idx >= 0:
-                        token = tokens[outcome_idx] if outcome_idx < len(tokens) else None
-                        if token:
-                            price = float(token.get("price", -1))
-                            # Only close if definitively resolved
-                            if price >= RESOLVED_THRESH or price <= (1 - RESOLVED_THRESH):
-                                self._update_trade_price(trade, price)
-                            # Otherwise leave open — don't guess
+                    if tokens and outcome_idx >= 0 and outcome_idx < len(tokens):
+                        price = float(tokens[outcome_idx].get("price", -1))
+                        if price >= RESOLVED_THRESH or price <= (1 - RESOLVED_THRESH):
+                            self._update_trade_price(trade, price)
             except Exception:
-                pass  # Leave open, try again next cycle
+                pass
 
     def _close_trade(self, trade: dict, final_price: float, won: bool):
         shares   = trade["shares"]
         cost     = trade["cost_usdc"]
-        proceeds = shares * final_price  # 1.0 if won, ~0 if lost
+        proceeds = shares * final_price
         pnl      = proceeds - cost
-        source   = trade["source"]
 
         self.db.db["paper_trades"].update_one(
             {"_id": trade["_id"]},
             {"$set": {
-                "status":        "closed",
-                "current_price": final_price,
-                "realized_pnl":  round(pnl, 4),
+                "status":         "closed",
+                "current_price":  final_price,
+                "realized_pnl":   round(pnl, 4),
                 "unrealized_pnl": 0.0,
-                "closed_at":     datetime.now(timezone.utc),
+                "closed_at":      datetime.now(timezone.utc),
             }}
         )
+        self._update_account(delta_balance=proceeds, delta_pnl=pnl, win=won)
+        if not won:
+            print(f"[Paper] LOSS | {trade['title'][:50]} | PnL: ${pnl:+.2f}")
 
-        # Return proceeds to balance, book PnL
-        self._update_account(source, delta_balance=proceeds, delta_pnl=pnl, win=won)
-        log.info(f"[Paper] Closed {'WIN' if won else 'LOSS'} {trade['title'][:40]} — PnL: ${pnl:+.2f}")
+    # ── Summary ───────────────────────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Summary stats per whale
-    # ------------------------------------------------------------------
-
-    def get_whale_summary(self, address: str) -> dict:
-        account = self.get_account(address)
+    def get_summary(self) -> dict:
+        account = self.get_account()
         if not account:
             return {}
 
-        open_trades   = list(self.db.db["paper_trades"].find({"source": address, "status": "open"}))
-        closed_trades = list(self.db.db["paper_trades"].find({"source": address, "status": "closed"}))
+        open_trades   = list(self.db.db["paper_trades"].find({"status": "open"}))
+        pending       = list(self.db.db["paper_trades"].find({"status": "pending_claim"}))
+        closed_trades = list(self.db.db["paper_trades"].find({"status": "closed"}))
 
-        unrealized = sum(t.get("unrealized_pnl", 0) for t in open_trades)
-        realized   = account.get("realized_pnl", 0)
-        balance    = account.get("balance", 0)
-        budget     = account.get("budget", BUDGET_PER_WHALE)
-        wagered    = account.get("total_wagered", 0)
-        wins       = account.get("wins", 0)
-        losses     = account.get("losses", 0)
+        unrealized  = sum(t.get("unrealized_pnl", 0) for t in open_trades + pending)
+        realized    = account.get("realized_pnl", 0)
+        balance     = account.get("balance", 0)
+        budget      = account.get("budget", BUDGET)
+        wins        = account.get("wins", 0)
+        losses      = account.get("losses", 0)
         total_closed = wins + losses
-        winrate    = round(wins / total_closed * 100, 1) if total_closed else 0
+        winrate     = round(wins / total_closed * 100, 1) if total_closed else 0
+
+        open_value  = sum(t.get("current_price", 0) * t.get("shares", 0) for t in open_trades + pending)
+        portfolio   = balance + open_value
 
         return {
-            "address":       address,
             "balance":       round(balance, 2),
+            "portfolio":     round(portfolio, 2),
+            "open_value":    round(open_value, 2),
             "budget":        budget,
             "realized_pnl":  round(realized, 2),
             "unrealized_pnl": round(unrealized, 2),
             "total_pnl":     round(realized + unrealized, 2),
-            "total_wagered": round(wagered, 2),
             "open_trades":   len(open_trades),
+            "pending_claims": len(pending),
             "wins":          wins,
             "losses":        losses,
             "winrate":       winrate,

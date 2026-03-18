@@ -7,11 +7,35 @@ logs them to MongoDB, and queues copy orders.
 import sys, os, time, logging
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import re
 from datetime import datetime, timezone
 from database.db import Database
 from connectors.polymarket import PolymarketConnector
 from engine.paper_trader import PaperTrader
 from engine.executor import Executor
+
+
+def _get_timeframe(title: str) -> str:
+    """Detect timeframe from market title. Returns '5m', '15m', '30m', '1h', or 'unknown'."""
+    # Match patterns like "12:00PM-12:15PM" or "12:00 PM - 12:15 PM"
+    pattern = r'(\d{1,2}):(\d{2})\s*([AP]M)\s*[-–]\s*(\d{1,2}):(\d{2})\s*([AP]M)'
+    m = re.search(pattern, title, re.IGNORECASE)
+    if m:
+        def to_minutes(h, mi, ampm):
+            h, mi = int(h), int(mi)
+            if ampm.upper() == 'PM' and h != 12:
+                h += 12
+            if ampm.upper() == 'AM' and h == 12:
+                h = 0
+            return h * 60 + mi
+        start = to_minutes(m.group(1), m.group(2), m.group(3))
+        end   = to_minutes(m.group(4), m.group(5), m.group(6))
+        diff  = (end - start) % (24 * 60)
+        if diff == 5:   return '5m'
+        if diff == 15:  return '15m'
+        if diff == 30:  return '30m'
+        if diff == 60:  return '1h'
+    return 'unknown'
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -42,12 +66,19 @@ class CopyTrader:
         else:
             print("[PAPER MODE] Simulated trading.")
 
-        self.watched = [
-            "0xd0d6053c3c37e727402d84c14069780d360993aa",  # whale1
-        ]
+        if live:
+            self.watched = [
+                "0xd0d6053c3c37e727402d84c14069780d360993aa",  # whale1 ~$2.7k portfolio
+            ]
+        else:
+            # Paper: same single wallet as paper_trader.py WALLET constant
+            self.watched = [
+                "0xd0d6053c3c37e727402d84c14069780d360993aa",  # whale1
+            ]
         # Track the latest seen trade ID per wallet to detect new ones
         # Loaded from DB on startup so it survives restarts
         self._last_seen: dict[str, str] = {}
+        self._cycle_count = 0
 
     # ------------------------------------------------------------------
     # Startup
@@ -59,7 +90,7 @@ class CopyTrader:
             addr = trader["address"]
             latest = self.db.get_latest_activity(addr, limit=1)
             if latest:
-                self._last_seen[addr] = latest[0].get("id", "")
+                self._last_seen[addr] = latest[0].get("transactionHash", "")
         log.info(f"Loaded last-seen for {len(self._last_seen)} wallets.")
 
     # ------------------------------------------------------------------
@@ -80,12 +111,17 @@ class CopyTrader:
                 print(f"[LIVE] Cleared {cleared.modified_count} stale pending signals.")
 
         while True:
-            traders = [t for t in self.db.get_watched_traders() if t["address"] in self.watched]
+            try:
+                traders = [t for t in self.db.get_watched_traders() if t["address"] in self.watched]
+            except Exception as e:
+                log.error(f"DB error loading traders: {e}")
+                time.sleep(self.poll_interval)
+                continue
             for trader in traders:
                 try:
                     self._check_wallet(trader)
                 except Exception as e:
-                    log.error(f"Error checking {trader['name']}: {e}")
+                    log.error(f"Error checking {trader.get('name','?')}: {e}")
 
             if self.live:
                 # Live mode — place real orders
@@ -104,11 +140,13 @@ class CopyTrader:
                         )
                     except Exception as e:
                         log.error(f"DB update error for signal {sig.get('_id')}: {e}")
-                # Check auto-withdrawal
-                try:
-                    self.executor.check_and_withdraw(self.db)
-                except Exception as e:
-                    log.error(f"Withdrawal check error: {e}")
+                # Check auto-withdrawal every 180 cycles (~3 min at 1s poll) to avoid excess API calls
+                self._cycle_count += 1
+                if self._cycle_count % 180 == 0:
+                    try:
+                        self.executor.check_and_withdraw(self.db)
+                    except Exception as e:
+                        log.error(f"Withdrawal check error: {e}")
             else:
                 # Paper mode
                 placed = self.paper.process_pending_signals()
@@ -164,13 +202,14 @@ class CopyTrader:
 
         # Parse the trade
         market_id    = trade.get("conditionId", "unknown")
+        title        = trade.get("title", market_id[:40])
+
         side         = trade.get("side", "").upper()         # BUY or SELL
         outcome      = trade.get("outcome", "")              # YES / NO / Up / Down
         outcome_idx  = trade.get("outcomeIndex", -1)
         size         = float(trade.get("size", 0))           # shares
         usdc_size    = float(trade.get("usdcSize", 0))       # USD value
         price        = float(trade.get("price", 0))          # 0.0–1.0
-        title        = trade.get("title", market_id[:40])
         asset        = trade.get("asset", "")
 
         print(
@@ -215,5 +254,5 @@ if __name__ == "__main__":
         print("  LIVE MODE — REAL MONEY")
         print("=" * 50)
 
-    ct = CopyTrader(poll_interval=3, live=args.live)
+    ct = CopyTrader(poll_interval=1, live=args.live)
     ct.run()
