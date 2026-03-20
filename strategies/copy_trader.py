@@ -8,9 +8,10 @@ import sys, os, time, logging
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from database.db import Database
 from connectors.polymarket import PolymarketConnector
+from connectors.mempool_watcher import MempoolWatcher
 from engine.paper_trader import PaperTrader
 from engine.executor import Executor
 
@@ -80,6 +81,36 @@ class CopyTrader:
         self._last_seen: dict[str, str] = {}
         self._cycle_count = 0
 
+        # Mempool watcher — fires signals before REST API indexes them
+        self._mempool_watcher: MempoolWatcher = None
+        try:
+            self._mempool_watcher = MempoolWatcher(
+                whale_address=self.watched[0],
+                on_trade=self._on_mempool_trade,
+            )
+        except ValueError as e:
+            print(f"[Mempool] Disabled — {e}")
+            log.warning(f"MempoolWatcher not started: {e}")
+
+    # ------------------------------------------------------------------
+    # Mempool callback (primary fast path)
+    # ------------------------------------------------------------------
+
+    def _on_mempool_trade(self, signal: dict):
+        """Called by MempoolWatcher when whale1 trade detected on-chain."""
+        tx_hash = signal.get("tx_hash", "")
+
+        # Dedup — REST poller might also see this trade
+        if tx_hash and self.db.signals.find_one({"tx_hash": tx_hash}):
+            return
+
+        self.db.signals.insert_one(signal)
+        log.info(f"[Mempool] Signal queued: {signal['side']} {signal.get('title','')[:40]}")
+
+        # Prevent REST poller from re-queuing the same tx
+        if tx_hash:
+            self._last_seen[signal["source"]] = tx_hash
+
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -100,6 +131,11 @@ class CopyTrader:
     def run(self):
         log.info("Copy trader started.")
         self.load_last_seen()
+
+        # Start mempool watcher in background thread (primary fast-path)
+        if self._mempool_watcher:
+            self._mempool_watcher.start()
+            print("[Mempool] Watcher started — primary detection active")
 
         if self.live:
             # Wipe any leftover pending signals from previous sessions
@@ -125,6 +161,17 @@ class CopyTrader:
 
             if self.live:
                 # Live mode — place real orders
+                # If session stop is active, flush the whole pending queue silently
+                bal = self.executor._cached_balance
+                if bal < self.executor._session_start_bal * (1 - 0.25):
+                    cleared = self.db.signals.update_many(
+                        {"status": "pending"},
+                        {"$set": {"status": "skipped", "skip_reason": "session_stop"}}
+                    )
+                    if cleared.modified_count:
+                        print(f"[LIVE] Session stop — cleared {cleared.modified_count} pending signals.")
+                    time.sleep(self.poll_interval)
+                    continue
                 try:
                     pending = list(self.db.signals.find({"status": "pending"}).sort("fired_at", 1).limit(50))
                 except Exception as e:
@@ -138,8 +185,34 @@ class CopyTrader:
                             {"_id": sig["_id"]},
                             {"$set": {"status": status, "order_resp": str(resp)}}
                         )
+                        # Store live trade for dashboard tracking
+                        if resp and sig.get("side", "BUY") == "BUY":
+                            scale    = self.executor._cached_balance / self.executor._whale_cash
+                            floor    = min(sig.get("usdc_size", 0), 0.50)
+                            our_usdc = max(sig.get("usdc_size", 0) * scale, floor)
+                            our_usdc = min(our_usdc, self.executor._cached_balance * 0.10)
+                            self.db.db["live_trades"].insert_one({
+                                "signal_id":   sig["_id"],
+                                "asset":       sig.get("asset", ""),
+                                "market_id":   sig.get("market_id", ""),
+                                "title":       sig.get("title", ""),
+                                "outcome":     sig.get("outcome", ""),
+                                "side":        "BUY",
+                                "entry_price": sig.get("price", 0),
+                                "cost_usdc":   round(our_usdc, 4),
+                                "shares":      round(our_usdc / sig.get("price", 1), 4) if sig.get("price") else 0,
+                                "current_price": sig.get("price", 0),
+                                "status":      "open",
+                                "opened_at":   datetime.now(timezone.utc),
+                            })
                     except Exception as e:
                         log.error(f"DB update error for signal {sig.get('_id')}: {e}")
+                # Update live trade prices every 30 cycles
+                if self._cycle_count % 30 == 0:
+                    try:
+                        self._update_live_positions()
+                    except Exception as e:
+                        log.error(f"Live position update error: {e}")
                 # Check auto-withdrawal every 180 cycles (~3 min at 1s poll) to avoid excess API calls
                 self._cycle_count += 1
                 if self._cycle_count % 180 == 0:
@@ -156,6 +229,47 @@ class CopyTrader:
 
             log.debug(f"Cycle complete. Sleeping {self.poll_interval}s...")
             time.sleep(self.poll_interval)
+
+    def _update_live_positions(self):
+        """Update current prices on open live trades and close resolved ones."""
+        import requests
+        open_trades = list(self.db.db["live_trades"].find({"status": "open"}))
+        for trade in open_trades:
+            asset = trade.get("asset", "")
+            if not asset:
+                continue
+            try:
+                r = requests.get(
+                    f"https://clob.polymarket.com/midpoint?token_id={asset}",
+                    timeout=3
+                )
+                mid = float(r.json().get("mid", 0))
+                if mid <= 0:
+                    continue
+                entry = trade.get("entry_price", 0)
+                cost  = trade.get("cost_usdc", 0)
+                shares = trade.get("shares", 0)
+                upnl  = (mid - entry) * shares
+                update = {"current_price": mid, "unrealized_pnl": round(upnl, 4)}
+                if mid >= 0.97:
+                    # Won — close it
+                    pnl = (mid - entry) * shares
+                    update.update({
+                        "status": "closed", "result": "win",
+                        "close_price": mid, "realized_pnl": round(pnl, 4),
+                        "closed_at": datetime.now(timezone.utc),
+                    })
+                elif mid <= 0.03:
+                    # Lost
+                    pnl = (mid - entry) * shares
+                    update.update({
+                        "status": "closed", "result": "loss",
+                        "close_price": mid, "realized_pnl": round(pnl, 4),
+                        "closed_at": datetime.now(timezone.utc),
+                    })
+                self.db.db["live_trades"].update_one({"_id": trade["_id"]}, {"$set": update})
+            except Exception:
+                continue
 
     def _check_wallet(self, trader: dict):
         addr = trader["address"]
@@ -197,6 +311,12 @@ class CopyTrader:
         addr = trader["address"]
         name = trader.get("name", addr[:8])
 
+        # Skip if mempool watcher already queued this trade
+        tx_hash = trade.get("transactionHash", "")
+        if tx_hash and self.db.signals.find_one({"tx_hash": tx_hash}):
+            log.debug(f"[REST] Skipping duplicate (mempool already caught it): {tx_hash[:14]}")
+            return
+
         # Log raw activity to DB
         self.db.log_trader_activity(addr, trade)
 
@@ -217,6 +337,17 @@ class CopyTrader:
             f"size={size:.2f} @ {price:.3f}"
         )
 
+        # Conviction: how many times has whale bet same direction on this asset in last 60s?
+        # More rapid same-direction bets = higher whale conviction = we size up.
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
+        conviction = self.db.signals.count_documents({
+            "asset":    asset,
+            "side":     side,
+            "source":   addr,
+            "fired_at": {"$gte": cutoff},
+        })
+        conviction = min(conviction + 1, 3)  # +1 for this signal, cap at 3x
+
         # Queue copy signal
         signal = {
             "type":         "copy_trade",
@@ -233,6 +364,7 @@ class CopyTrader:
             "title":        title,
             "tx_hash":      trade.get("transactionHash", ""),
             "raw_trade":    trade,
+            "conviction":   conviction,
             "status":       "pending",  # pending → executed / skipped
             "fired_at":     datetime.now(timezone.utc),
         }

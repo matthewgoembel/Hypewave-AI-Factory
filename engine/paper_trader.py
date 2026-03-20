@@ -14,37 +14,60 @@ from connectors.polymarket import PolymarketConnector
 log = logging.getLogger("paper_trader")
 
 # ── Config — change WALLET to test a different whale ──────────────────────────
-WALLET          = "0xd0d6053c3c37e727402d84c14069780d360993aa"  # whale1
-BUDGET          = 100.0   # starting paper balance
-MIN_TRADE_USD   = 0.50
-CLOB_FEE        = 0.005   # 0.5% per trade
-RESOLVED_THRESH = 0.97
-CLAIM_DELAY_S   = 60      # seconds before a won position returns cash
+WALLET           = "0xd0d6053c3c37e727402d84c14069780d360993aa"  # whale1
+BUDGET           = 100.0   # starting paper balance
+FLAT_BET         = 1.50    # flat bet per trade — simple, consistent, proven
+MAX_TRADE_PCT    = 0.05    # never risk more than 5% of balance on one trade
+SESSION_LOSS_PCT = 0.25    # halt new buys if down 25% from session start
+CLOB_FEE         = 0.005   # 0.5% per trade
+RESOLVED_THRESH  = 0.97
+CLAIM_DELAY_S    = 60      # seconds before a won position returns cash
 
 
 class PaperTrader:
     def __init__(self):
         self.db = Database()
         self.pm = PolymarketConnector()
-        self._whale_portfolio = self._fetch_whale_portfolio()
+        self._whale_cash = self._fetch_whale_cash()
         self._ensure_account()
+        acct = self.get_account()
+        self._session_start_balance = acct["balance"] if acct else BUDGET
 
-    # ── Whale portfolio for proportional scaling ──────────────────────────────
+    # ── Whale cash for proportional scaling ───────────────────────────────────
+    # Scale against whale's available CASH, not total portfolio.
+    # Total portfolio includes locked positions — cash is what he's actively
+    # betting with, so it gives proportional bets that make sense.
 
-    def _fetch_whale_portfolio(self) -> float:
+    def _fetch_whale_cash(self) -> float:
         try:
+            # Total portfolio value (cash + positions)
             r = requests.get(
                 f"https://data-api.polymarket.com/value?user={WALLET}",
                 timeout=5
             )
             data = r.json()
-            if isinstance(data, list) and data:
-                val = float(data[0].get("value", 0))
-                if val > 0:
-                    return val
+            total = float(data[0].get("value", 0)) if isinstance(data, list) and data else 0
+
+            # Positions value
+            r2 = requests.get(
+                f"https://data-api.polymarket.com/positions?user={WALLET}&sizeThreshold=0",
+                timeout=5
+            )
+            positions = r2.json()
+            pos_value = 0.0
+            if isinstance(positions, list):
+                pos_value = sum(
+                    float(p.get("curPrice", 0)) * float(p.get("size", 0))
+                    for p in positions
+                )
+
+            cash = total - pos_value
+            if cash > 100:
+                log.info(f"Whale cash estimated: ${cash:,.0f} (total ${total:,.0f} - positions ${pos_value:,.0f})")
+                return cash
         except Exception:
             pass
-        return 35895.0  # fallback
+        return 2000.0  # fallback: conservative cash estimate
 
     # ── Account setup ─────────────────────────────────────────────────────────
 
@@ -81,11 +104,30 @@ class PaperTrader:
         if win is False: update["$inc"]["losses"] = 1
         self.db.db["paper_accounts"].update_one({"address": WALLET}, update)
 
+    # ── Fetch real CLOB price (mirrors live executor) ─────────────────────────
+
+    def _fetch_live_price(self, asset: str, side: str) -> float | None:
+        """Fetch current best price from CLOB — same call live executor uses."""
+        try:
+            r = requests.get(
+                "https://clob.polymarket.com/price",
+                params={"token_id": asset, "side": side},
+                timeout=3,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                p = float(data.get("price", 0))
+                if 0 < p < 1:
+                    return p
+        except Exception:
+            pass
+        return None
+
     # ── Execute a signal ──────────────────────────────────────────────────────
 
     def execute_signal(self, signal: dict) -> bool:
         source = signal.get("source", "")
-        if source != WALLET:
+        if source.lower() != WALLET.lower():
             return False
 
         account = self.get_account()
@@ -97,10 +139,16 @@ class PaperTrader:
         side        = signal.get("side", "BUY")
         outcome     = signal.get("outcome", "")
         outcome_idx = signal.get("outcome_idx", -1)
-        price       = signal.get("price", 0)
+        whale_price = signal.get("price", 0)
         title       = signal.get("title", "")
 
-        if price <= 0 or price >= 1:
+        # Fetch real current CLOB price — mirrors what live executor would pay
+        live_price = self._fetch_live_price(asset, side) if asset else None
+        price = live_price if live_price else whale_price
+        slippage = round(price - whale_price, 4) if live_price else 0.0
+
+        # Skip only dust (<3¢) and near-resolved — cheap tokens are WHERE the edge lives
+        if price <= 0.03 or price >= 0.97:
             return False
 
         # SELL — close open position
@@ -121,16 +169,16 @@ class PaperTrader:
             return True
 
         # BUY
-        whale_usdc = signal.get("usdc_size", 0)
-        if whale_usdc < MIN_TRADE_USD:
+        # Dedup — don't open a second position on the same asset
+        existing = self.db.db["paper_trades"].find_one({"asset": asset, "status": "open"})
+        if existing:
             self.db.signals.update_one(
                 {"_id": signal["_id"]},
-                {"$set": {"status": "skipped", "skip_reason": "too small"}}
+                {"$set": {"status": "skipped", "skip_reason": "already holding asset"}}
             )
             return False
 
         balance = account["balance"]
-
         if balance <= 0:
             print(f"[Paper] Balance too low: ${balance:.2f}")
             self.db.signals.update_one(
@@ -139,11 +187,30 @@ class PaperTrader:
             )
             return False
 
-        scale    = balance / self._whale_portfolio
-        our_usdc = max(whale_usdc * scale, MIN_TRADE_USD)
+        # Session stop — halt new buys if down 25% from session start
+        if balance < self._session_start_balance * (1 - SESSION_LOSS_PCT):
+            self.db.signals.update_one(
+                {"_id": signal["_id"]},
+                {"$set": {"status": "skipped", "skip_reason": "session stop triggered"}}
+            )
+            print(f"[Paper] SESSION STOP — ${balance:.2f} vs session start ${self._session_start_balance:.2f}")
+            return False
+
+        # Flat bet with conviction multiplier.
+        # Conviction = how many same-direction bets whale fired in last 60s.
+        # 1 bet → $1.50, 2 bets → $3.00, 3+ bets → $4.50 (capped at 5% of balance)
+        conviction = min(signal.get("conviction", 1), 3)
+        our_usdc   = FLAT_BET * conviction
+        our_usdc   = min(our_usdc, balance * MAX_TRADE_PCT)
+
+        if our_usdc < 0.50:
+            self.db.signals.update_one(
+                {"_id": signal["_id"]},
+                {"$set": {"status": "skipped", "skip_reason": f"too small after cap (${our_usdc:.3f})"}}
+            )
+            return False
 
         if our_usdc > balance:
-            print(f"[Paper] Balance too low: ${balance:.2f}")
             self.db.signals.update_one(
                 {"_id": signal["_id"]},
                 {"$set": {"status": "skipped", "skip_reason": "insufficient balance"}}
@@ -162,7 +229,9 @@ class PaperTrader:
             "side":          side,
             "outcome":       outcome,
             "outcome_idx":   outcome_idx,
-            "entry_price":   price,
+            "whale_price":   whale_price,   # whale's actual fill price
+            "entry_price":   price,          # our simulated fill (real CLOB price)
+            "slippage":      slippage,       # price - whale_price
             "shares":        our_shares,
             "cost_usdc":     our_usdc,
             "title":         title,
@@ -180,7 +249,8 @@ class PaperTrader:
             {"_id": signal["_id"]},
             {"$set": {"status": "executed", "paper_trade_usdc": our_usdc}}
         )
-        print(f"[Paper] BUY {outcome} | {title[:50]} | ${our_usdc:.2f} @ {price:.3f}")
+        slip_str = f" slip={slippage:+.3f}" if slippage else ""
+        print(f"[Paper] BUY {outcome} | {title[:50]} | ${our_usdc:.2f} @ {price:.3f}{slip_str}")
         return True
 
     # ── Process pending signals ───────────────────────────────────────────────

@@ -25,6 +25,8 @@ WITHDRAW_TRIGGER  = 1000.0   # withdraw when balance hits $1000
 WITHDRAW_KEEP     = 100.0    # keep $100 on Polymarket (Phase 1)
 WITHDRAW_KEEP_P2  = 500.0    # keep $500 once Phase 2 starts (after first withdrawal)
 PHASE2_THRESHOLD  = 500.0    # once we've withdrawn once, keep $500 base
+FLAT_BET          = 1.50     # flat bet per trade
+SESSION_LOSS_PCT  = 0.25     # halt new buys if down 25% from session start
 
 
 class Executor:
@@ -45,14 +47,16 @@ class Executor:
             log.error(f"[Executor] Failed to derive API creds: {e}")
             self.creds = None
 
-        # Fetch whale portfolio for proportional scaling
-        self._whale_portfolio   = self._fetch_whale_portfolio()
+        # Fetch whale cash for proportional scaling (cash only, not total portfolio)
+        self._whale_cash        = self._fetch_whale_cash()
         self._whale_fetch_cycle = 0
-        print(f"[Executor] Whale portfolio: ${self._whale_portfolio:,.2f}")
+        print(f"[Executor] Whale cash: ${self._whale_cash:,.2f}")
 
         # Cached balance — refreshed every 30 seconds instead of per-trade
-        self._cached_balance     = self.get_balance()
-        self._balance_cache_time = datetime.now(timezone.utc)
+        self._cached_balance      = self.get_balance()
+        self._balance_cache_time  = datetime.now(timezone.utc)
+        self._session_start_bal   = self._cached_balance
+        print(f"[Executor] Session start balance: ${self._session_start_bal:.2f}")
 
     # ------------------------------------------------------------------
     # Balance
@@ -74,21 +78,34 @@ class Executor:
     # Whale portfolio (for proportional scaling)
     # ------------------------------------------------------------------
 
-    def _fetch_whale_portfolio(self) -> float:
-        """Fetch whale's total portfolio value for proportional sizing."""
+    def _fetch_whale_cash(self) -> float:
+        """Fetch whale's available cash (total portfolio minus open positions)."""
         try:
             r = requests.get(
                 f"https://data-api.polymarket.com/value?user={WHALE_ADDRESS}",
                 timeout=5,
             )
             data = r.json()
-            if isinstance(data, list) and data:
-                val = float(data[0].get("value", 0))
-                if val > 0:
-                    return val
+            total = float(data[0].get("value", 0)) if isinstance(data, list) and data else 0
+
+            r2 = requests.get(
+                f"https://data-api.polymarket.com/positions?user={WHALE_ADDRESS}&sizeThreshold=0",
+                timeout=5,
+            )
+            positions = r2.json()
+            pos_value = 0.0
+            if isinstance(positions, list):
+                pos_value = sum(
+                    float(p.get("curPrice", 0)) * float(p.get("size", 0))
+                    for p in positions
+                )
+            cash = total - pos_value
+            if cash > 100:
+                log.info(f"[Executor] Whale cash: ${cash:,.0f} (total ${total:,.0f} - positions ${pos_value:,.0f})")
+                return cash
         except Exception as e:
-            log.warning(f"[Executor] Could not fetch whale portfolio: {e}")
-        return 35895.0  # fallback to last known value
+            log.warning(f"[Executor] Could not fetch whale cash: {e}")
+        return 2000.0  # fallback
 
     # ------------------------------------------------------------------
     # Position lookup
@@ -135,6 +152,27 @@ class Executor:
             log.warning(f"[Executor] Skipping BUY with no usdc_size: {title}")
             return None
 
+        # Skip only true dust — cheap tokens are the high-leverage edge, not a problem
+        if side == "BUY" and price < 0.03:
+            log.debug(f"[Executor] Skipping dust trade ({price:.2f}): {title}")
+            return None
+
+        # Session stop — halt new BUYs if down 25% from session start balance
+        if side == "BUY":
+            now = datetime.now(timezone.utc)
+            if (now - self._balance_cache_time).total_seconds() > 30:
+                self._cached_balance     = self.get_balance()
+                self._balance_cache_time = now
+            if self._cached_balance < self._session_start_bal * (1 - SESSION_LOSS_PCT):
+                print(f"[LIVE] SESSION STOP — down 25% from start (${self._session_start_bal:.2f} → ${self._cached_balance:.2f})")
+                log.warning(f"[Executor] Session stop triggered at ${self._cached_balance:.2f}")
+                return None
+
+        # Position dedup — don't buy the same asset again if already open
+        if side == "BUY" and self._get_position_size(asset) >= 5:
+            log.debug(f"[Executor] Already holding {asset[:12]}… — skipping duplicate BUY")
+            return None
+
         # Skip signals older than 10 minutes — market likely expired
         fired_at = signal.get("fired_at")
         if fired_at:
@@ -147,41 +185,35 @@ class Executor:
         whale_shares = float(signal.get("size", 0))
 
         if side == "SELL":
-            # Follow whale exits — sell our actual position in this asset
+            # Follow whale exits immediately — any position, no minimum
             shares = self._get_position_size(asset)
             if shares <= 0:
-                log.debug(f"[Executor] SELL skipped — no position held for {title}")
+                log.debug(f"[Executor] SELL skipped — no position for {title}")
                 return None
-            log.info(f"[Executor] SELL {title} — closing {shares} shares")
+            log.info(f"[Executor] SELL {title} — closing {shares:.2f} shares")
         else:
-            # BUY — proportional scaling: mirror whale's position size at our account ratio
-            # Use cached balance — refreshes every 30s instead of every trade
-            now = datetime.now(timezone.utc)
-            if (now - self._balance_cache_time).total_seconds() > 30:
-                self._cached_balance     = self.get_balance()
-                self._balance_cache_time = now
+            # BUY — flat bet with conviction multiplier
+            # Balance was already refreshed in session stop check above
             real_balance = self._cached_balance
             if real_balance < 1.0:
                 log.warning(f"[Executor] Balance too low: ${real_balance:.2f}")
                 return None
 
-            # Refresh whale portfolio every 200 trades
-            self._whale_fetch_cycle += 1
-            if self._whale_fetch_cycle % 200 == 0:
-                self._whale_portfolio = self._fetch_whale_portfolio()
-                log.info(f"[Executor] Whale portfolio refreshed: ${self._whale_portfolio:,.2f}")
+            # Conviction = how many same-direction bets whale fired in last 60s
+            # 1 → $1.50, 2 → $3.00, 3+ → $4.50, always capped at 5% of balance
+            conviction = min(signal.get("conviction", 1), 3)
+            our_size   = FLAT_BET * conviction
+            our_size   = min(our_size, real_balance * 0.05)
 
-            # Scale = our balance / whale portfolio — mirror his sizing proportionally
-            scale    = real_balance / self._whale_portfolio
-            our_size = usdc_size * scale
-            our_size = max(our_size, 1.00)  # Polymarket minimum $1
-            shares   = round(our_size / price, 2)
+            if our_size < 0.50:
+                log.debug(f"[Executor] Bet too small after cap (${our_size:.2f}): {title}")
+                return None
+
+            shares = round(our_size / price, 2)
             if shares < 5:
-                shares   = 5.0
-                our_size = shares * price
-            if shares * price < 1.00:
-                shares   = round(1.01 / price, 2)
-                our_size = shares * price
+                # Polymarket minimum order is 5 shares — skip if we can't meet it
+                log.debug(f"[Executor] Below min shares ({shares:.2f}) at price {price:.3f}: {title}")
+                return None
 
         try:
             order_args = OrderArgs(
