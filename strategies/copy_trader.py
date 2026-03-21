@@ -80,6 +80,7 @@ class CopyTrader:
         # Loaded from DB on startup so it survives restarts
         self._last_seen: dict[str, str] = {}
         self._cycle_count = 0
+        self._session_stop_time = None  # when session stop first fired
 
         # Mempool watcher — fires signals before REST API indexes them
         self._mempool_watcher: MempoolWatcher = None
@@ -161,9 +162,21 @@ class CopyTrader:
 
             if self.live:
                 # Live mode — place real orders
-                # If session stop is active, flush the whole pending queue silently
-                bal = self.executor._cached_balance
-                if bal < self.executor._session_start_bal * (1 - 0.25):
+                # Always use fresh balance for session stop decision
+                bal = self.executor.get_balance()
+                self.executor._cached_balance = bal
+                self.executor._balance_cache_time = datetime.now(timezone.utc)
+
+                if bal < self.executor._session_start_bal * (1 - 0.40):
+                    if self._session_stop_time is None:
+                        self._session_stop_time = datetime.now(timezone.utc)
+                        print(f"[LIVE] Session stop — balance ${bal:.2f} (start ${self.executor._session_start_bal:.2f}). Will resume if balance recovers.")
+                    # After 15 min cooldown, reset session start to current balance
+                    elif (datetime.now(timezone.utc) - self._session_stop_time).total_seconds() >= 900:
+                        self.executor._session_start_bal = bal
+                        self.executor._ordered_assets.clear()
+                        self._session_stop_time = None
+                        print(f"[LIVE] Session reset after cooldown — new start balance ${bal:.2f}")
                     cleared = self.db.signals.update_many(
                         {"status": "pending"},
                         {"$set": {"status": "skipped", "skip_reason": "session_stop"}}
@@ -172,6 +185,12 @@ class CopyTrader:
                         print(f"[LIVE] Session stop — cleared {cleared.modified_count} pending signals.")
                     time.sleep(self.poll_interval)
                     continue
+
+                # Balance recovered or never hit stop — resume/continue trading
+                if self._session_stop_time is not None:
+                    print(f"[LIVE] Balance recovered to ${bal:.2f} — resuming trading.")
+                    self.executor._ordered_assets.clear()
+                    self._session_stop_time = None
                 try:
                     pending = list(self.db.signals.find({"status": "pending"}).sort("fired_at", 1).limit(50))
                 except Exception as e:

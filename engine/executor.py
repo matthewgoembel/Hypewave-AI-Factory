@@ -26,7 +26,7 @@ WITHDRAW_KEEP     = 100.0    # keep $100 on Polymarket (Phase 1)
 WITHDRAW_KEEP_P2  = 500.0    # keep $500 once Phase 2 starts (after first withdrawal)
 PHASE2_THRESHOLD  = 500.0    # once we've withdrawn once, keep $500 base
 FLAT_BET          = 1.50     # flat bet per trade
-SESSION_LOSS_PCT  = 0.25     # halt new buys if down 25% from session start
+SESSION_LOSS_PCT  = 0.40     # halt new buys if down 40% from session start
 
 
 class Executor:
