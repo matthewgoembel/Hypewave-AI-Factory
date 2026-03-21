@@ -171,12 +171,17 @@ class CopyTrader:
                     if self._session_stop_time is None:
                         self._session_stop_time = datetime.now(timezone.utc)
                         print(f"[LIVE] Session stop — balance ${bal:.2f} (start ${self.executor._session_start_bal:.2f}). Will resume if balance recovers.")
-                    # After 15 min cooldown, reset session start to current balance
-                    elif (datetime.now(timezone.utc) - self._session_stop_time).total_seconds() >= 900:
-                        self.executor._session_start_bal = bal
-                        self.executor._ordered_assets.clear()
-                        self._session_stop_time = None
-                        print(f"[LIVE] Session reset after cooldown — new start balance ${bal:.2f}")
+                    # Reset at the next 15-minute market boundary (:00, :15, :30, :45)
+                    else:
+                        now = datetime.now(timezone.utc)
+                        mins = now.minute
+                        on_boundary = mins % 15 == 0 and now.second < 5
+                        past_stop   = (now - self._session_stop_time).total_seconds() >= 60
+                        if on_boundary and past_stop:
+                            self.executor._session_start_bal = bal
+                            self.executor._ordered_assets.clear()
+                            self._session_stop_time = None
+                            print(f"[LIVE] Session reset at :{mins:02d} boundary — new start balance ${bal:.2f}")
                     cleared = self.db.signals.update_many(
                         {"status": "pending"},
                         {"$set": {"status": "skipped", "skip_reason": "session_stop"}}
