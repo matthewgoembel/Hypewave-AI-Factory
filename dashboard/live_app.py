@@ -152,13 +152,14 @@ def render(slot, db):
         # ── Summary metrics ────────────────────────────────────────────────
         avg_delay   = df["_delay_s"].dropna().mean()
         avg_slip    = df["_slip_c"].dropna().mean()
-        our_total   = closed["_our_pnl"].dropna().sum()
-        whale_total = closed["_whale_pnl"].dropna().sum()
-        open_value  = open_["_cost"].sum()
-        n_closed    = len(closed)
-        n_wins      = int((closed["_our_pnl"] > 0).sum()) if not closed.empty else 0
-        wr          = round(n_wins / n_closed * 100, 1) if n_closed else 0
-        roi         = our_total / 100 * 100
+        our_total    = closed["_our_pnl"].dropna().sum()
+        whale_total  = closed["_whale_pnl"].dropna().sum()
+        open_value   = open_["_cost"].sum()
+        total_wagered = closed["_cost"].sum()
+        n_closed     = len(closed)
+        n_wins       = int((closed["_our_pnl"] > 0).sum()) if not closed.empty else 0
+        wr           = round(n_wins / n_closed * 100, 1) if n_closed else 0
+        roi          = (our_total / total_wagered * 100) if total_wagered else 0
 
         m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
         m1.metric("Avg Fill Delay",  fmt_delay(avg_delay) if avg_delay else "—")
@@ -169,7 +170,7 @@ def render(slot, db):
         m5.metric("Whale Est. PnL",  f"${whale_total:+.2f}",
                   help="Estimated whale PnL on same markets")
         m6.metric("Win Rate",        f"{wr}%", f"{n_wins}W / {n_closed - n_wins}L")
-        m7.metric("ROI",             f"{roi:+.1f}%", "from $100")
+        m7.metric("ROI",             f"{roi:+.1f}%", "on closed trades")
 
         st.divider()
 

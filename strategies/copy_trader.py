@@ -187,23 +187,25 @@ class CopyTrader:
                         )
                         # Store live trade for dashboard tracking
                         if resp and sig.get("side", "BUY") == "BUY":
-                            scale    = self.executor._cached_balance / self.executor._whale_cash
-                            floor    = min(sig.get("usdc_size", 0), 0.50)
-                            our_usdc = max(sig.get("usdc_size", 0) * scale, floor)
-                            our_usdc = min(our_usdc, self.executor._cached_balance * 0.10)
+                            # Use same flat bet + conviction formula as executor
+                            conviction = min(sig.get("conviction", 1), 3)
+                            our_usdc   = 1.50 * conviction
+                            our_usdc   = min(our_usdc, self.executor._cached_balance * 0.05)
+                            price      = sig.get("price", 0)
+                            our_shares = round(our_usdc / price, 4) if price else 0
                             self.db.db["live_trades"].insert_one({
-                                "signal_id":   sig["_id"],
-                                "asset":       sig.get("asset", ""),
-                                "market_id":   sig.get("market_id", ""),
-                                "title":       sig.get("title", ""),
-                                "outcome":     sig.get("outcome", ""),
-                                "side":        "BUY",
-                                "entry_price": sig.get("price", 0),
-                                "cost_usdc":   round(our_usdc, 4),
-                                "shares":      round(our_usdc / sig.get("price", 1), 4) if sig.get("price") else 0,
-                                "current_price": sig.get("price", 0),
-                                "status":      "open",
-                                "opened_at":   datetime.now(timezone.utc),
+                                "signal_id":     sig["_id"],
+                                "asset":         sig.get("asset", ""),
+                                "market_id":     sig.get("market_id", ""),
+                                "title":         sig.get("title", ""),
+                                "outcome":       sig.get("outcome", ""),
+                                "side":          "BUY",
+                                "entry_price":   price,
+                                "cost_usdc":     round(our_usdc, 4),
+                                "shares":        our_shares,
+                                "current_price": price,
+                                "status":        "open",
+                                "opened_at":     datetime.now(timezone.utc),
                             })
                     except Exception as e:
                         log.error(f"DB update error for signal {sig.get('_id')}: {e}")
