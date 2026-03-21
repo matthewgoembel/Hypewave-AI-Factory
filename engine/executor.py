@@ -58,6 +58,9 @@ class Executor:
         self._session_start_bal   = self._cached_balance
         print(f"[Executor] Session start balance: ${self._session_start_bal:.2f}")
 
+        # In-memory dedup — tracks assets ordered this session to prevent race conditions
+        self._ordered_assets: set = set()
+
     # ------------------------------------------------------------------
     # Balance
     # ------------------------------------------------------------------
@@ -168,7 +171,11 @@ class Executor:
                 log.warning(f"[Executor] Session stop triggered at ${self._cached_balance:.2f}")
                 return None
 
-        # Position dedup — don't buy the same asset again if already open
+        # Position dedup — in-memory check prevents race conditions from rapid signals
+        if side == "BUY" and asset in self._ordered_assets:
+            log.debug(f"[Executor] Already ordered {asset[:12]}… — skipping duplicate BUY")
+            return None
+        # Also check live position as fallback (catches positions from previous sessions)
         if side == "BUY" and self._get_position_size(asset) >= 5:
             log.debug(f"[Executor] Already holding {asset[:12]}… — skipping duplicate BUY")
             return None
@@ -224,6 +231,12 @@ class Executor:
             )
             signed_order = self.client.create_order(order_args)
             resp = self.client.post_order(signed_order, OrderType.GTC)
+
+            # Update in-memory dedup set
+            if side == "BUY":
+                self._ordered_assets.add(asset)
+            elif side == "SELL":
+                self._ordered_assets.discard(asset)
 
             display_size = shares * price if side == "SELL" else our_size  # noqa: F821
             log.info(
