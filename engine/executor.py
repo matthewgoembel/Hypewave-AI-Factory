@@ -155,9 +155,11 @@ class Executor:
             log.warning(f"[Executor] Skipping BUY with no usdc_size: {title}")
             return None
 
-        # Skip only true dust — cheap tokens are the high-leverage edge, not a problem
-        if side == "BUY" and price < 0.03:
-            log.debug(f"[Executor] Skipping dust trade ({price:.2f}): {title}")
+        # Only skip sub-half-cent — the whale's edge IS buying 1-5¢ near-expiry tokens
+        # (buying Up at 1¢ on a market about to resolve Up = near-certain 100x)
+        # The 5-share minimum is the real floor; don't filter by price alone.
+        if side == "BUY" and price < 0.005:
+            log.debug(f"[Executor] Skipping sub-half-cent dust ({price:.4f}): {title}")
             return None
 
         # Session stop — halt new BUYs if down 25% from session start balance

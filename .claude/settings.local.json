@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "WebSearch"
+      "WebSearch",
+      "WebFetch(domain:data-api.polymarket.com)",
+      "WebFetch(domain:polymarket.com)"
     ]
   }
 }

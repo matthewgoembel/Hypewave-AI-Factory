@@ -18,7 +18,7 @@ WALLET           = "0xd0d6053c3c37e727402d84c14069780d360993aa"  # whale1
 BUDGET           = 100.0   # starting paper balance
 FLAT_BET         = 1.50    # flat bet per trade — simple, consistent, proven
 MAX_TRADE_PCT    = 0.05    # never risk more than 5% of balance on one trade
-SESSION_LOSS_PCT = 0.25    # halt new buys if down 25% from session start
+SESSION_LOSS_PCT = 0.40    # halt new buys if down 40% from session start
 CLOB_FEE         = 0.005   # 0.5% per trade
 RESOLVED_THRESH  = 0.97
 CLAIM_DELAY_S    = 60      # seconds before a won position returns cash
@@ -147,8 +147,8 @@ class PaperTrader:
         price = live_price if live_price else whale_price
         slippage = round(price - whale_price, 4) if live_price else 0.0
 
-        # Skip only dust (<3¢) and near-resolved — cheap tokens are WHERE the edge lives
-        if price <= 0.03 or price >= 0.97:
+        # Only skip sub-half-cent — whale's edge IS buying 1-5¢ near-expiry tokens
+        if price <= 0.005 or price >= 0.995:
             return False
 
         # SELL — close open position
