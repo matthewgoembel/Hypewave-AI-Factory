@@ -10,6 +10,7 @@ db.db["paper_accounts"].delete_many({})
 db.db["paper_trades"].delete_many({})
 db.db["signals"].delete_many({})
 db.db["watched_traders"].delete_many({})
+db.db["live_trades"].delete_many({})
 
 whales = [
     ("0xd0d6053c3c37e727402d84c14069780d360993aa", "whale1"),

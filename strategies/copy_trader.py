@@ -358,6 +358,12 @@ class CopyTrader:
         if not usdc_by_outcome:
             return
 
+        # Ignore dust signals — whale must have bet at least $0.50 on dominant side
+        # to be worth copying. Filters out test/accidental tiny trades.
+        if max(usdc_by_outcome.values()) < 0.50:
+            log.debug(f"[Agg] Skipping dust signal for {condition_id[:12]} (max ${max(usdc_by_outcome.values()):.2f})")
+            return
+
         dominant_outcome = max(usdc_by_outcome, key=usdc_by_outcome.get)
         dominant_usdc    = usdc_by_outcome[dominant_outcome]
         total_usdc       = sum(usdc_by_outcome.values())

@@ -15,7 +15,7 @@ log = logging.getLogger("paper_trader")
 
 # ── Config — change WALLET to test a different whale ──────────────────────────
 WALLET           = "0xd0d6053c3c37e727402d84c14069780d360993aa"  # whale1
-BUDGET           = 100.0   # starting paper balance
+BUDGET           = 50.0    # starting paper balance
 FLAT_BET         = 1.50    # flat bet per trade — simple, consistent, proven
 MAX_TRADE_PCT    = 0.05    # never risk more than 5% of balance on one trade
 SESSION_LOSS_PCT = 0.40    # halt new buys if down 40% from session start
